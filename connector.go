@@ -117,6 +117,8 @@ type WapiHttpRequestor struct {
 
 type IBConnector interface {
 	CreateObject(obj IBObject) (ref string, err error)
+	GetObjectPaginated(obj IBObject, ref string, queryParams *QueryParams, pageID *string) (ReturnObject, error)
+	NewObjectIterator(obj IBObject, ref string, queryParams *QueryParams) *ObjectIterator
 	GetObject(obj IBObject, ref string, queryParams *QueryParams, res interface{}) error
 	DeleteObject(ref string) (refRes string, err error)
 	UpdateObject(obj IBObject, ref string) (refRes string, err error)
@@ -443,6 +445,148 @@ func (c *Connector) GetObject(
 	}
 
 	return
+}
+
+// ReturnObject represents a paginated response
+type ReturnObject struct {
+	Result     []IBObject `json:"result"`
+	NextPageID string     `json:"next_page_id,omitempty"`
+}
+
+// ObjectIterator provides iteration over paginated results
+type ObjectIterator struct {
+	connector   *Connector
+	obj         IBObject
+	ref         string
+	nextPage    string
+	err         error
+	buffer      []IBObject
+	bufIndex    int
+	queryParams *QueryParams
+}
+
+// GetObjectPaginated retrieves objects with pagination support
+func (c *Connector) GetObjectPaginated(
+	obj IBObject,
+	ref string,
+	queryParams *QueryParams,
+	pageID *string,
+) (ReturnObject, error) {
+
+	if queryParams == nil {
+		queryParams = NewQueryParams(false, nil)
+	}
+
+	// Set pagination defaults - these will override any existing values
+	queryParams.searchFields["_paging"] = "1"
+	queryParams.searchFields["_return_as_object"] = "1"
+	queryParams.searchFields["_max_results"] = "1000"
+	queryParams.searchFields["_return_type"] = "json"
+
+	// Add page ID if provided
+	if pageID != nil && *pageID != "" {
+		queryParams.searchFields["_page_id"] = *pageID
+	}
+
+	resp, err := c.makeRequest(GET, obj, ref, queryParams)
+	if err != nil {
+		return ReturnObject{}, fmt.Errorf("request failed: %w", err)
+	}
+
+	return c.parseResponse(resp, obj)
+}
+
+// parseResponse handles the response parsing logic
+func (c *Connector) parseResponse(resp []byte, obj IBObject) (ReturnObject, error) {
+	var result ReturnObject
+
+	// Try parsing as paginated response first
+	type rawResponse struct {
+		Result     []json.RawMessage `json:"result"`
+		NextPageID string            `json:"next_page_id,omitempty"`
+	}
+
+	var rawResp rawResponse
+	if err := json.Unmarshal(resp, &rawResp); err != nil {
+		return result, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Handle empty response
+	if len(rawResp.Result) == 0 {
+		return result, nil
+	}
+
+	// Parse each result
+	result.Result = make([]IBObject, len(rawResp.Result))
+	for i, rawMsg := range rawResp.Result {
+		// Create a new instance of the object type
+		newObj := reflect.New(reflect.TypeOf(obj).Elem()).Interface().(IBObject)
+
+		if err := json.Unmarshal(rawMsg, newObj); err != nil {
+			return result, fmt.Errorf("failed to parse item %d: %w", i, err)
+		}
+		result.Result[i] = newObj
+	}
+
+	result.NextPageID = rawResp.NextPageID
+	return result, nil
+}
+
+// NewObjectIterator creates a new iterator for paginated objects
+func (c *Connector) NewObjectIterator(
+	obj IBObject,
+	ref string,
+	queryParams *QueryParams,
+) *ObjectIterator {
+	return &ObjectIterator{
+		connector:   c,
+		obj:         obj,
+		ref:         ref,
+		bufIndex:    0,
+		queryParams: queryParams,
+	}
+}
+
+// Next returns true if there are more items to process
+func (it *ObjectIterator) Next() bool {
+	// If we have items in buffer, return true
+	if it.bufIndex < len(it.buffer) {
+		return true
+	}
+
+	// If we had an error or reached the end (no next page), return false
+	if it.err != nil || (len(it.buffer) > 0 && it.nextPage == "") {
+		return false
+	}
+
+	// Fetch next page
+	result, err := it.connector.GetObjectPaginated(it.obj, it.ref, it.queryParams, &it.nextPage)
+	if err != nil {
+		it.err = err
+		return false
+	}
+
+	// Update iterator state
+	it.buffer = result.Result
+	it.nextPage = result.NextPageID
+	it.bufIndex = 0
+
+	return len(it.buffer) > 0
+}
+
+// Value returns the current item
+func (it *ObjectIterator) Value() IBObject {
+	if it.bufIndex < len(it.buffer) {
+		item := it.buffer[it.bufIndex]
+		it.bufIndex++
+		return item
+	}
+	return nil
+}
+
+// Error returns any error that occurred during iteration
+func (it *ObjectIterator) Error() error {
+	return it.err
 }
 
 func (c *Connector) DeleteObject(ref string) (refRes string, err error) {
